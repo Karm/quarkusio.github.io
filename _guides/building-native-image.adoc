@@ -549,9 +549,13 @@ debug symbols for native executables can be generated for Linux environments
 (Windows support is still under development).
 These symbols can be used to debug native executables with tools such as `gdb`.
 
+NOTE: The area of native executable debugging is still under development and this guide works
+with Quarkus 1.7.5.Final. Other releases might have different source locations. Updates will
+ be posted here.
+
 To generate debug symbols,
 add `-Dquarkus.native.debug.enabled=true` flag when generating the native executable.
-You will find the debug symbols for the native executable in a `.debug` file next to the native executable.
+You will find the debug symbols for the native executable in a `.debug` file next to the native executable in `target/` directory.
 
 Aside from debug symbols,
 setting `-Dquarkus.native.debug.enabled=true` flag generates a cache of source files
@@ -567,6 +571,160 @@ This step is required in order to pull the sources for these dependencies,
 and get them included in the source cache.
 
 The location of source cache is `target/{project.name}-{project.version}-native-image-source-jar/sources` folder.
+
+=== Example debug sessions
+
+You can follow three example debug sessions on the same simple Quarkus application.
+
+[source,shell]
+----
+cd /tmp
+curl -O -J  https://code.quarkus.io/api/download
+unzip code-with-quarkus.zip
+cd code-with-quarkus/
+----
+
+NOTE:  Make sure `<quarkus-plugin.version>` and `<quarkus.platform.version>` is 1.7.5.Final. Make sure you work in `/tmp` directory or adjust paths used below accordingly.
+
+==== Build locally, debug locally
+
+Prerequisites: https://www.gnu.org/software/gdb/[gdb], Oracle GraalVM 20.2 or https://github.com/graalvm/mandrel/releases[Mandrel 20.1+] set as GRAALVM_HOME and JAVA_HOME with its `bin/` on PATH.
+
+The following builds the executable, creates a file with debug symbols, assembles sources and starts a `gdb` session:
+
+[source,shell]
+----
+./mvnw package -Pnative -Dquarkus.native.debug.enabled=true
+./mvnw dependency:sources
+gdb ./target/code-with-quarkus-1.0.0-SNAPSHOT-runner
+----
+
+NOTE: `gdb` might have complained about missing debug symbols
+for some of the libraries on your system the native image executable depends on. Install additional debug symbols at your discretion.
+
+We are in a `gdb` debug session now. The following `gdb` commands:
+
+ * https://sourceware.org/gdb/current/onlinedocs/gdb/Source-Path.html#Source-Path[set the directories] with
+source code files,
+
+ * create a https://sourceware.org/gdb/current/onlinedocs/gdb/Set-Breaks.html#Set-Breaks[breakpoint],
+
+ * https://sourceware.org/gdb/current/onlinedocs/gdb/Starting.html#Starting[run] Quarkus app in background (hit Enter),
+
+ * execute `curl` in the background to access the application so as the breakpoint is hit,
+
+ * list threads, marking the one we are in with an asterisk,
+
+ * print the stack trace,
+
+ * and do two https://sourceware.org/gdb/current/onlinedocs/gdb/Continuing-and-Stepping.html#Continuing-and-Stepping[steps] through the program execution,
+
+ * finally letting Quarkus continue with execution.
+
+
+[source,shell]
+----
+set directories /tmp/code-with-quarkus/target/code-with-quarkus-1.0.0-SNAPSHOT-native-image-source-jar/sources:/tmp/code-with-quarkus/target/code-with-quarkus-1.0.0-SNAPSHOT-native-image-source-jar/sources/src
+break ExampleResource.java:14
+run&
+shell curl localhost:8080/hello &
+info threads
+backtrace
+step
+step
+continue&
+----
+
+As the program continue, you should see "hello" printed in your terminal within your `gdb` session. You quit the session with `q`.
+
+==== Build in container, debug locally
+
+Requirements: As above plus a working container runtime (default docker, or `-Dquarkus.native.container-runtime=podman`).
+
+The binary produced is built with a UBI8, i.e. RHEL 8, amd64 based container by default and might be incompatible with your local workstation.
+
+[source,shell]
+----
+./mvnw package -Pnative -Dquarkus.native.container-build=true -Dquarkus.native.builder-image=quay.io/quarkus/ubi-quarkus-mandrel:20.1-java11  -Dquarkus.native.debug.enabled=true
+./mvnw dependency:sources
+gdb ./target/code-with-quarkus-1.0.0-SNAPSHOT-runner
+----
+
+Location of sources for `set directories` is identical to the aforementioned session and it might proceed in a similar fashion. You can additionally explore more `gdb` commands. Note that information about local and global variables is not available with the current Mandrel 20.1.x version.
+
+==== Build in container, debug in container
+
+The application is built using a UBI8 amd64 based builder container and we will run it in a UBI8 Minimal container.
+
+===== Build the binary
+
+Build the binary, debug symbols and assemble sources. The snippet is the same as above but for starting the `gdb` session:
+
+[source,shell]
+----
+./mvnw package -Pnative -Dquarkus.native.container-build=true -Dquarkus.native.builder-image=quay.io/quarkus/ubi-quarkus-mandrel:20.1-java11  -Dquarkus.native.debug.enabled=true
+./mvnw dependency:sources
+----
+
+===== Prepare Dockerfile.native.debug
+
+Prepare `src/main/docker/Dockerfile.native.debug` as noted below and `rm .dockerignore` in this example.
+
+[source,dockerfile]
+----
+FROM registry.access.redhat.com/ubi8/ubi-minimal
+RUN microdnf --enablerepo=*debug* install gdb glibc-debuginfo zlib-debuginfo
+WORKDIR /work/
+COPY target/*-runner /work/application
+COPY target/*-runner.debug /work/
+COPY target/*image-source-jar/sources /work/sources
+RUN chmod 775 /work
+EXPOSE 8080
+CMD ["./application", "-Dquarkus.http.host=0.0.0.0"]
+----
+
+* `microdnf` - we install gdb and debug symbols for some of the libraries the executable depend on. It depends on how deeply you need to go in your debugging. You can omit any additional debuginfo installation.
+* `COPY` - we copy debug symbols file and sources to the image.
+
+Apart from these changes, there is no modification to a usual Quarkus native Dockerfile. Most importantly, we use the same base image to remain as close to production setup as possible during our debug session.
+
+===== Build and run application image
+
+We build our application image using the aforementioned Dockerfile:
+
+[source,shell]
+----
+docker build -f src/main/docker/Dockerfile.native.debug -t my-quarkus-mandrel-app .
+----
+
+Running the container requires additional flags allowing the container to access otherwise unavailable system features in order to let `gdb` do its work and stop/trace our Quarkus process.
+
+[source,shell]
+----
+docker run --cap-add=SYS_PTRACE --security-opt="seccomp=unconfined" -i --rm -p 8080:8080 --name quarkus_runner my-quarkus-mandrel-app
+----
+
+===== GDB session within a container
+
+Open a new terminal, start a new shell within your running Quarkus application container and open a new `gdb` session:
+
+[source,shell]
+----
+docker exec -i -t quarkus_runner /usr/bin/gdb /work/application 1
+----
+
+One needs to set the location of the source files in the `gdb` session with `set directories`.
+Instead of using `run&` to start Quarkus in background, we just `attach` to already running
+process within the container. The PID of that process is `1`.
+
+[source,shell]
+----
+set directories /work/sources:/work/sources/src
+break ExampleResource.java:14
+----
+
+You are now attached to the process and your session is switched to some thread. You can use `info threads` and e.g. `thread 21` to attach to a different thread.
+Access your application in a browser on http://localhost:8080/hello[localhost:8080/hello] and go back to the `gdb` session.
 
 [[configuration-reference]]
 == Configuring the Native Executable
